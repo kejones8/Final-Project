@@ -1,0 +1,260 @@
+---
+title: "Final Project Prelim Analysis"
+author: "Kate Jones"
+date: "10/11/2019"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE,cache=TRUE)
+```
+
+# First attempt at plot level data: Coweeta LTER
+
+***My first attempt at finding plot level data for image classification lead me to the Coweeta LTER in western NC. The data were accessible and had a kml file ready to go, but unfortunatley, the plot dimensions, nor the corner coordinates were made clear. Below is the preliminary exploration of plot data conducted before realizing the georeferencing was not up to snuff. ***
+
+```{r}
+library(data.table)
+# GOAL: figure out which plots within Coweeta data have pure species information
+setwd("C:\\Users\\The Brain\\OneDrive - North Carolina State University\\F2019 - Classes\\GIS 713\\Final-Project")
+
+#read in csv file of coweeta data from all plots
+cow_trees<-as.data.frame(read.csv(".\\Tree_Data_1_1155.csv",header=TRUE,row.names=NULL,stringsAsFactors = FALSE))
+#clean up the dataframe
+cow_trees<-cow_trees[-c(1:4),]
+#renme the columns
+colnames(cow_trees) = c("date","site","plot","species","dbh","status","comments")
+#turn dbh to numeric 
+cow_trees$dbh<-as.numeric(cow_trees$dbh)
+
+#turn this to a data.table
+cow_dt<-as.data.table(cow_trees)
+
+#after looking at the kml files, I choose a test site that would have plots entirely in the forest, so the imagery would be entirely forest and not other landcover types
+fall_site<-as.data.table(cow_dt[cow_dt$site=="FALL",])
+
+#now i'm interested in finding plots that are almost entirely one species
+byplot_spec<-fall_site[dbh>10,species,by=plot]
+
+#specifically, i'm likely interested in larger trees because of their presence in the canopy
+byplot_numspec<-fall_site[dbh>10,.N,by=list(plot,site)]
+
+#filtering out for live trees
+siteandplot<-cow_dt[dbh>10|status=="alive",no_of_spec := length(unique(species)),by=list(plot,site)]
+
+#this returns the number of species (of living trees) tallied for each plot at this site
+nonas<-na.omit(siteandplot,cols="no_of_spec")
+setorder(nonas, -no_of_spec)
+
+```
+
+# Vegbank Data
+
+***I quickly tabeled the Coweeta data after the suggestion to use the VegBank data (http://vegbank.org/vegbank/index.jsp).***
+
+***The accuracy differs across Vegbank plots, but my criteria for searching were:*** 
+
+1. Greater than 85% canopy cover for the SOI
+  + white oak
+  + red maple
+2. Classified as accurate to 10m
+3. Exact latitude and longitude (centroid) given for a rectangular plot
+
+
+***For my oreliminary analysis, I did not download any VegBank data. I simply used their advanced query system to find plots that meet the criteria above. I then manually created polygons in R with the appropriate centroid and extent.***
+
+***One serious road block for this analysis could be that the data collection years for VegBank data varies widely. The years for data collection might not correspond well to the much newer Sentinel-2 data. Although, I am trying classify late successional forest, so given there was no major disturbance, the species information from VegBank could still be accurate.***
+
+#Creating plot polygons from VegBank data: White Oak
+
+```{r, echo=FALSE}
+
+library(rgdal)
+library(sp)
+
+#plot no. = 042-05-0629
+#store centroid coordinate for plot in western NC with canopy 85% white oak 
+ll_x<- -82.580218036 
+ll_y<- 35.205450602
+
+#store in object to pass to SPointsDF coords argument
+ll_coords<-cbind(ll_x,ll_y)
+#make a df to pass to SpointsDF df argument
+df<-as.data.frame(ll_coords)
+#input projection
+ll <-"+init=epsg:4326"
+#what we want the projection to be
+utm<-"+proj=utm +zone=17 +ellps=WGS84 +datum=WGS84 +units=m +no_defs"
+
+#create centroid SPDF
+wo_centroid<-SpatialPointsDataFrame(ll_coords,df)
+#set projection for centroid in input form (latlong)
+proj4string(wo_centroid)<-CRS(ll)
+#transform centroid to utm
+wo_centroid_utm <- spTransform(wo_centroid, CRS(utm))
+
+#then get reprojected centroid
+utm_centroid<-as.data.frame(wo_centroid_utm@coords)
+colnames(utm_centroid)<-c("x","y")
+
+#get centroids in utm
+utm_x<-utm_centroid$x 
+utm_y<-utm_centroid$y
+
+# radius in meters, the plots are 1000 m2
+radius <- sqrt(1000)/2
+
+#make twice the size for extracting pixels
+big_radius<-sqrt(1000)
+
+# define the plot edges based upon the plot radius
+yPlus <- utm_y+radius
+xPlus <- utm_x+radius
+yMinus <- utm_y-radius
+xMinus <- utm_x-radius
+
+#make bigger box
+yplus_big<-utm_y+big_radius
+xplus_big<-utm_x+big_radius
+yminus_big<-utm_y-big_radius
+xminus_big<-utm_x-big_radius
+
+utm_bbox = matrix(c(xMinus,yPlus,# NW corner
+                xPlus, yPlus,# NE corner
+                xPlus,yMinus,# SE corner
+                xMinus,yMinus,# SW corner
+                xMinus,yPlus), # NW corner again - close ploygon
+             ncol = 2, byrow = TRUE)
+
+big_utm_bbox= matrix(c(xminus_big,yplus_big,# NW corner
+                xplus_big, yplus_big,# NE corner
+                xplus_big,yminus_big,# SE corner
+                xminus_big,yminus_big,# SW corner
+                xminus_big,yplus_big), # NW corner again - close ploygon
+                ncol = 2, byrow = TRUE)
+
+
+P1 = Polygon(utm_bbox)
+wo_utm_bbox = SpatialPolygons(list(Polygons(list(P1), ID = "a")), proj4string=CRS(utm))
+#plot(wo_utm_bbox, axes = TRUE)
+#points(utm_centroid$x,utm_centroid$y)
+
+#create a bigger box for extracting pixels
+P2 = Polygon(big_utm_bbox)
+big_wo_utm_bbox = SpatialPolygons(list(Polygons(list(P2), ID = "b")), proj4string=CRS(utm))
+
+```
+
+# Reading in Sentinel Data
+
+```{r}
+
+library(utils)
+library(raster)
+
+zipfile<-"C:\\Users\\The Brain\\Downloads\\S2B_MSIL2A_20190815T160829_N0213_R140_T17SLV_20190815T203237.zip"
+
+unzip(zipfile, exdir = ".")
+
+path_to_rast<-"C:\\Users\\The Brain\\OneDrive - North Carolina State University\\F2019 - Classes\\GIS 713\\Final-Project\\sent\\GRANULE\\L2A_T17SLV_A012750_20190815T161632\\IMG_DATA\\R10m"
+
+raster_data<-list.files(path=path_to_rast,full.names = TRUE)
+
+s <- raster::stack(raster_data)
+stack<-s[[2:5]]
+
+stack.sub <- crop(stack, extent(wo_utm_bbox))
+#clip_rasts <- raster::mask(wo_utm_bbox, stack)
+
+b02 <- raster(raster_data[2])#produces raster layer
+b03 <- raster(raster_data[3])#produces sp object
+b04 <- readGDAL(raster_data[4])#originally used rgdal because i was worried about about sentinal file types
+b08 <- readGDAL(raster_data[5])#produces sp object
+
+b03_crop <- raster::intersect(b03, big_wo_utm_bbox)
+
+plot(b03_crop)
+plot(wo_utm_bbox, add=TRUE)
+points(utm_centroid)
+plot(big_wo_utm_bbox,add=TRUE)
+
+
+plot(mask(b03_crop, big_wo_utm_bbox))
+```
+
+# Creating plot polygon from VegBank data: Red Maple
+
+```{r}
+
+#plot no. = 017-01-0026
+#store centroid coordinate for plot in western NC with canopy 85% red maple 
+rm_ll_x<- -77.036533569
+rm_ll_y<- 35.861254385
+
+#store in object to pass to SPointsDF coords argument
+ll_rm_coords<-cbind(rm_ll_x,rm_ll_y)
+#make a df to pass to SpointsDF df argument
+rm_df<-as.data.frame(ll_rm_coords)
+
+#create centroid SPDF
+rm_centroid<-SpatialPointsDataFrame(ll_rm_coords,rm_df)
+#set projection for centroid in input form (latlong)
+proj4string(rm_centroid)<-CRS(ll)
+#transform centroid to utm
+rm_centroid_utm <- spTransform(rm_centroid, CRS(utm))
+
+#then get reprojected centroid
+rm_utm_centroid<-as.data.frame(rm_centroid_utm@coords)
+colnames(rm_utm_centroid)<-c("x","y")
+
+#get centroids in utm
+rm_utm_x<-rm_utm_centroid$x 
+rm_utm_y<-rm_utm_centroid$y
+
+
+# define the plot edges based upon the plot radius
+yPlus <- rm_utm_y+radius
+xPlus <- rm_utm_x+radius
+yMinus <- rm_utm_y-radius
+xMinus <- rm_utm_x-radius
+
+#make bigger box
+yplus_big<-rm_utm_y+big_radius
+xplus_big<-rm_utm_x+big_radius
+yminus_big<-rm_utm_y-big_radius
+xminus_big<-rm_utm_x-big_radius
+
+r_utm_bbox = matrix(c(xMinus,yPlus,# NW corner
+                xPlus, yPlus,# NE corner
+                xPlus,yMinus,# SE corner
+                xMinus,yMinus,# SW corner
+                xMinus,yPlus), # NW corner again - close ploygon
+             ncol = 2, byrow = TRUE)
+
+big_rm_utm_bbox= matrix(c(xminus_big,yplus_big,# NW corner
+                xplus_big, yplus_big,# NE corner
+                xplus_big,yminus_big,# SE corner
+                xminus_big,yminus_big,# SW corner
+                xminus_big,yplus_big), # NW corner again - close ploygon
+                ncol = 2, byrow = TRUE)
+
+
+P1 = Polygon(r_utm_bbox)
+rm_utm_bbox = SpatialPolygons(list(Polygons(list(P1), ID = "a")), proj4string=CRS(utm))
+
+#create a bigger box for extracting pixels
+P2 = Polygon(big_rm_utm_bbox)
+big_rm_utm_bbox = SpatialPolygons(list(Polygons(list(P2), ID = "b")), proj4string=CRS(utm))
+
+b03_crop1<- raster::intersect(b03, big_rm_utm_bbox)
+
+plot(b03_crop1)
+plot(rm_utm_bbox, add=TRUE)
+points(rm_utm_centroid)
+plot(big_rm_utm_bbox,add=TRUE)
+
+
+plot(mask(b03_crop, big_wo_utm_bbox))
+
+```
+
